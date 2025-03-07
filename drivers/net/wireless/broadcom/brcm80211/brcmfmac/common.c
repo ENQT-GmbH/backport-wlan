@@ -20,8 +20,6 @@
 #include "of.h"
 #include "firmware.h"
 #include "chip.h"
-#include "fweh.h"
-#include <brcm_hw_ids.h>
 
 MODULE_AUTHOR("Broadcom Corporation");
 MODULE_DESCRIPTION("Broadcom 802.11 wireless LAN fullmac driver.");
@@ -103,7 +101,7 @@ void brcmf_c_set_joinpref_default(struct brcmf_if *ifp)
 
 static int brcmf_c_download(struct brcmf_if *ifp, u16 flag,
 			    struct brcmf_dload_data_le *dload_buf,
-			    u32 len, const char *var)
+			    u32 len)
 {
 	s32 err;
 
@@ -112,19 +110,19 @@ static int brcmf_c_download(struct brcmf_if *ifp, u16 flag,
 	dload_buf->dload_type = cpu_to_le16(DL_TYPE_CLM);
 	dload_buf->len = cpu_to_le32(len);
 	dload_buf->crc = cpu_to_le32(0);
+	len = sizeof(*dload_buf) + len - 1;
 
-	err = brcmf_fil_iovar_data_set(ifp, var, dload_buf,
-				       struct_size(dload_buf, data, len));
+	err = brcmf_fil_iovar_data_set(ifp, "clmload", dload_buf, len);
 
 	return err;
 }
 
-static int brcmf_c_download_blob(struct brcmf_if *ifp,
-				 const void *data, size_t size,
-				 const char *loadvar, const char *statvar)
+static int brcmf_c_process_clm_blob(struct brcmf_if *ifp)
 {
 	struct brcmf_pub *drvr = ifp->drvr;
+	struct brcmf_bus *bus = drvr->bus_if;
 	struct brcmf_dload_data_le *chunk_buf;
+	const struct firmware *clm = NULL;
 	u32 chunk_len;
 	u32 datalen;
 	u32 cumulative_len;
@@ -134,14 +132,20 @@ static int brcmf_c_download_blob(struct brcmf_if *ifp,
 
 	brcmf_dbg(TRACE, "Enter\n");
 
-	chunk_buf = kzalloc(struct_size(chunk_buf, data, MAX_CHUNK_LEN),
-			    GFP_KERNEL);
-	if (!chunk_buf) {
-		err = -ENOMEM;
-		return -ENOMEM;
+	err = brcmf_bus_get_blob(bus, &clm, BRCMF_BLOB_CLM);
+	if (err || !clm) {
+		brcmf_info("no clm_blob available (err=%d), device may have limited channels available\n",
+			   err);
+		return 0;
 	}
 
-	datalen = size;
+	chunk_buf = kzalloc(sizeof(*chunk_buf) + MAX_CHUNK_LEN - 1, GFP_KERNEL);
+	if (!chunk_buf) {
+		err = -ENOMEM;
+		goto done;
+	}
+
+	datalen = clm->size;
 	cumulative_len = 0;
 	do {
 		if (datalen > MAX_CHUNK_LEN) {
@@ -150,10 +154,9 @@ static int brcmf_c_download_blob(struct brcmf_if *ifp,
 			chunk_len = datalen;
 			dl_flag |= DL_END;
 		}
-		memcpy(chunk_buf->data, data + cumulative_len, chunk_len);
+		memcpy(chunk_buf->data, clm->data + cumulative_len, chunk_len);
 
-		err = brcmf_c_download(ifp, dl_flag, chunk_buf, chunk_len,
-				       loadvar);
+		err = brcmf_c_download(ifp, dl_flag, chunk_buf, chunk_len);
 
 		dl_flag &= ~DL_BEGIN;
 
@@ -162,64 +165,20 @@ static int brcmf_c_download_blob(struct brcmf_if *ifp,
 	} while ((datalen > 0) && (err == 0));
 
 	if (err) {
-		bphy_err(drvr, "%s (%zu byte file) failed (%d)\n",
-			 loadvar, size, err);
-		/* Retrieve status and print */
-		err = brcmf_fil_iovar_int_get(ifp, statvar, &status);
+		bphy_err(drvr, "clmload (%zu byte file) failed (%d)\n",
+			 clm->size, err);
+		/* Retrieve clmload_status and print */
+		err = brcmf_fil_iovar_int_get(ifp, "clmload_status", &status);
 		if (err)
-			bphy_err(drvr, "get %s failed (%d)\n", statvar, err);
+			bphy_err(drvr, "get clmload_status failed (%d)\n", err);
 		else
-			brcmf_dbg(INFO, "%s=%d\n", statvar, status);
+			brcmf_dbg(INFO, "clmload_status=%d\n", status);
 		err = -EIO;
 	}
 
 	kfree(chunk_buf);
-	return err;
-}
-
-static int brcmf_c_process_clm_blob(struct brcmf_if *ifp)
-{
-	struct brcmf_pub *drvr = ifp->drvr;
-	struct brcmf_bus *bus = drvr->bus_if;
-	const struct firmware *fw = NULL;
-	s32 err;
-
-	brcmf_dbg(TRACE, "Enter\n");
-
-	err = brcmf_bus_get_blob(bus, &fw, BRCMF_BLOB_CLM);
-	if (err || !fw) {
-		brcmf_info("no clm_blob available (err=%d), device may have limited channels available\n",
-			   err);
-		return 0;
-	}
-
-	err = brcmf_c_download_blob(ifp, fw->data, fw->size,
-				    "clmload", "clmload_status");
-
-	release_firmware(fw);
-	return err;
-}
-
-static int brcmf_c_process_txcap_blob(struct brcmf_if *ifp)
-{
-	struct brcmf_pub *drvr = ifp->drvr;
-	struct brcmf_bus *bus = drvr->bus_if;
-	const struct firmware *fw = NULL;
-	s32 err;
-
-	brcmf_dbg(TRACE, "Enter\n");
-
-	err = brcmf_bus_get_blob(bus, &fw, BRCMF_BLOB_TXCAP);
-	if (err || !fw) {
-		brcmf_info("no txcap_blob available (err=%d)\n", err);
-		return 0;
-	}
-
-	brcmf_info("TxCap blob found, loading\n");
-	err = brcmf_c_download_blob(ifp, fw->data, fw->size,
-				    "txcapload", "txcapload_status");
-
-	release_firmware(fw);
+done:
+	release_firmware(clm);
 	return err;
 }
 
@@ -248,27 +207,10 @@ static const u8 brcmf_default_mac_address[ETH_ALEN] = {
 	0x00, 0x90, 0x4c, 0xc5, 0x12, 0x38
 };
 
-static int brcmf_c_process_cal_blob(struct brcmf_if *ifp)
-{
-	struct brcmf_pub *drvr = ifp->drvr;
-	struct brcmf_mp_device *settings = drvr->settings;
-	s32 err;
-
-	brcmf_dbg(TRACE, "Enter\n");
-
-	if (!settings->cal_blob || !settings->cal_size)
-		return 0;
-
-	brcmf_info("Calibration blob provided by platform, loading\n");
-	err = brcmf_c_download_blob(ifp, settings->cal_blob, settings->cal_size,
-				    "calload", "calload_status");
-	return err;
-}
-
 int brcmf_c_preinit_dcmds(struct brcmf_if *ifp)
 {
 	struct brcmf_pub *drvr = ifp->drvr;
-	struct brcmf_fweh_info *fweh = drvr->fweh;
+	s8 eventmask[BRCMF_EVENTING_MASK_LEN];
 	u8 buf[BRCMF_DCMD_SMLEN];
 	struct brcmf_bus *bus;
 	struct brcmf_rev_info_le revinfo;
@@ -276,8 +218,6 @@ int brcmf_c_preinit_dcmds(struct brcmf_if *ifp)
 	char *clmver;
 	char *ptr;
 	s32 err;
-	struct eventmsgs_ext *eventmask_msg = NULL;
-	u8 msglen;
 
 	if (is_valid_ether_addr(ifp->mac_addr)) {
 		/* set mac address */
@@ -350,20 +290,6 @@ int brcmf_c_preinit_dcmds(struct brcmf_if *ifp)
 		goto done;
 	}
 
-	/* Do TxCap downloading, if needed */
-	err = brcmf_c_process_txcap_blob(ifp);
-	if (err < 0) {
-		bphy_err(drvr, "download TxCap blob file failed, %d\n", err);
-		goto done;
-	}
-
-	/* Download external calibration blob, if available */
-	err = brcmf_c_process_cal_blob(ifp);
-	if (err < 0) {
-		bphy_err(drvr, "download calibration blob file failed, %d\n", err);
-		goto done;
-	}
-
 	/* query for 'ver' to get version info from firmware */
 	memset(buf, 0, sizeof(buf));
 	err = brcmf_fil_iovar_data_get(ifp, "ver", buf, sizeof(buf));
@@ -372,7 +298,6 @@ int brcmf_c_preinit_dcmds(struct brcmf_if *ifp)
 			 err);
 		goto done;
 	}
-	buf[sizeof(buf) - 1] = '\0';
 	ptr = (char *)buf;
 	strsep(&ptr, "\n");
 
@@ -380,12 +305,8 @@ int brcmf_c_preinit_dcmds(struct brcmf_if *ifp)
 	brcmf_info("Firmware: %s %s\n", ri->chipname, buf);
 
 	/* locate firmware version number for ethtool */
-	ptr = strrchr(buf, ' ');
-	if (!ptr) {
-		bphy_err(drvr, "Retrieving version number failed");
-		goto done;
-	}
-	strscpy(ifp->drvr->fwver, ptr + 1, sizeof(ifp->drvr->fwver));
+	ptr = strrchr(buf, ' ') + 1;
+	strscpy(ifp->drvr->fwver, ptr, sizeof(ifp->drvr->fwver));
 
 	/* Query for 'clmver' to get CLM version info from firmware */
 	memset(buf, 0, sizeof(buf));
@@ -393,16 +314,14 @@ int brcmf_c_preinit_dcmds(struct brcmf_if *ifp)
 	if (err) {
 		brcmf_dbg(TRACE, "retrieving clmver failed, %d\n", err);
 	} else {
-		buf[sizeof(buf) - 1] = '\0';
 		clmver = (char *)buf;
+		/* store CLM version for adding it to revinfo debugfs file */
+		memcpy(ifp->drvr->clmver, clmver, sizeof(ifp->drvr->clmver));
 
 		/* Replace all newline/linefeed characters with space
 		 * character
 		 */
 		strreplace(clmver, '\n', ' ');
-
-		/* store CLM version for adding it to revinfo debugfs file */
-		memcpy(ifp->drvr->clmver, clmver, sizeof(ifp->drvr->clmver));
 
 		brcmf_dbg(INFO, "CLM version = %s\n", clmver);
 	}
@@ -417,61 +336,20 @@ int brcmf_c_preinit_dcmds(struct brcmf_if *ifp)
 	brcmf_c_set_joinpref_default(ifp);
 
 	/* Setup event_msgs, enable E_IF */
-	err = brcmf_fil_iovar_data_get(ifp, "event_msgs", fweh->event_mask,
-				       fweh->event_mask_len);
+	err = brcmf_fil_iovar_data_get(ifp, "event_msgs", eventmask,
+				       BRCMF_EVENTING_MASK_LEN);
 	if (err) {
 		bphy_err(drvr, "Get event_msgs error (%d)\n", err);
 		goto done;
 	}
-	/*
-	 * BRCMF_E_IF can safely be used to set the appropriate bit
-	 * in the event_mask as the firmware event code is guaranteed
-	 * to match the value of BRCMF_E_IF because it is old cruft
-	 * that all vendors have.
-	 */
-	setbit(fweh->event_mask, BRCMF_E_IF);
-	err = brcmf_fil_iovar_data_set(ifp, "event_msgs", fweh->event_mask,
-				       fweh->event_mask_len);
+	setbit(eventmask, BRCMF_E_IF);
+	err = brcmf_fil_iovar_data_set(ifp, "event_msgs", eventmask,
+				       BRCMF_EVENTING_MASK_LEN);
 	if (err) {
 		bphy_err(drvr, "Set event_msgs error (%d)\n", err);
 		goto done;
 	}
 
-	/* Enable event_msg_ext specific to 43012 chip */
-	if (bus->chip == CY_CC_43012_CHIP_ID) {
-		/* Program event_msg_ext to support event larger than 128 */
-		msglen = (roundup(fweh->num_event_codes, NBBY) / NBBY) +
-				  EVENTMSGS_EXT_STRUCT_SIZE;
-		/* Allocate buffer for eventmask_msg */
-		eventmask_msg = kzalloc(msglen, GFP_KERNEL);
-		if (!eventmask_msg) {
-			err = -ENOMEM;
-			goto done;
-		}
-
-		/* Read the current programmed event_msgs_ext */
-		eventmask_msg->ver = EVENTMSGS_VER;
-		eventmask_msg->len = roundup(fweh->num_event_codes, NBBY) / NBBY;
-		err = brcmf_fil_iovar_data_get(ifp, "event_msgs_ext",
-					       eventmask_msg,
-					       msglen);
-
-		/* Enable ULP event */
-		brcmf_dbg(EVENT, "enable event ULP\n");
-		setbit(eventmask_msg->mask, BRCMF_E_ULP);
-
-		/* Write updated Event mask */
-		eventmask_msg->ver = EVENTMSGS_VER;
-		eventmask_msg->command = EVENTMSGS_SET_MASK;
-		eventmask_msg->len = (roundup(fweh->num_event_codes, NBBY) / NBBY);
-
-		err = brcmf_fil_iovar_data_set(ifp, "event_msgs_ext",
-					       eventmask_msg, msglen);
-		if (err) {
-			brcmf_err("Set event_msgs_ext error (%d)\n", err);
-			goto done;
-		}
-	}
 	/* Setup default scan channel time */
 	err = brcmf_fil_cmd_int_set(ifp, BRCMF_C_SET_SCAN_CHANNEL_TIME,
 				    BRCMF_DEFAULT_SCAN_CHANNEL_TIME);
@@ -601,7 +479,6 @@ struct brcmf_mp_device *brcmf_get_module_param(struct device *dev,
 		/* No platform data for this device, try OF and DMI data */
 		brcmf_dmi_probe(settings, chip, chiprev);
 		brcmf_of_probe(dev, bus_type, settings);
-		brcmf_acpi_probe(dev, bus_type, settings);
 	}
 	return settings;
 }
@@ -623,16 +500,18 @@ static int __init brcmf_common_pd_probe(struct platform_device *pdev)
 	return 0;
 }
 
-static void brcmf_common_pd_remove(struct platform_device *pdev)
+static int brcmf_common_pd_remove(struct platform_device *pdev)
 {
 	brcmf_dbg(INFO, "Enter\n");
 
 	if (brcmfmac_pdata->power_off)
 		brcmfmac_pdata->power_off();
+
+	return 0;
 }
 
 static struct platform_driver brcmf_pd = {
-	.remove_new	= brcmf_common_pd_remove,
+	.remove		= brcmf_common_pd_remove,
 	.driver		= {
 		.name	= BRCMFMAC_PDATA_NAME,
 	}
