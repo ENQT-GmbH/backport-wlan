@@ -18,4 +18,12 @@
 #define  SDIO_BUS_SCSI		0x40	/* Support continuous SPI interrupt */
 #endif
 
+#ifndef SDIO_DEVICE_ID_BROADCOM_43439
+#define SDIO_DEVICE_ID_BROADCOM_43439		0xa9af
+#endif
+
+#ifndef SDIO_VENDOR_ID_CYPRESS
+#define SDIO_VENDOR_ID_CYPRESS			0x04b4
+#endif
+
 #endif /* __BACKPORT_MMC_SDIO_H */
